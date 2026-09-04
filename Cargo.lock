@@ -628,7 +628,7 @@ dependencies = [
 [[package]]
 name = "dln-e2e-harness"
 version = "0.1.0"
-source = "git+https://github.com/DarkWebDivingClub/diamond-x-e2e.git?branch=master#b1725f35520059eddbf41641a69f0667c8997873"
+source = "git+https://github.com/DarkWebDivingClub/diamond-x-e2e-test.git?branch=master#b1725f35520059eddbf41641a69f0667c8997873"
 dependencies = [
  "anyhow",
  "hex",
@@ -1478,7 +1478,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr-faucet-e2e"
+name = "nostr-faucet-e2e-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",

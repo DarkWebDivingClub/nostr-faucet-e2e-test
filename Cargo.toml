@@ -1,12 +1,12 @@
 [package]
-name = "nostr-faucet-e2e"
+name = "nostr-faucet-e2e-test"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "End-to-end scenarios for nostr-faucet against locally spun chains."
 
 [dependencies]
-dln-e2e-harness = { git = "https://github.com/DarkWebDivingClub/diamond-x-e2e.git", branch = "master" }
+dln-e2e-harness = { git = "https://github.com/DarkWebDivingClub/diamond-x-e2e-test.git", branch = "master" }
 
 nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
 nwc = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
