@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "End-to-end scenarios for nostr-faucet against locally spun chains."
+publish = false
 
 [dependencies]
 dln-e2e-harness = { git = "https://github.com/DarkWebDivingClub/diamond-x-e2e-test.git", branch = "master" }
