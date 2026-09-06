@@ -1,28 +1,31 @@
 //! The limits, and who may change them.
 //!
 //! `faucet_funds_alice` proves the faucet pays. This proves it stops, and
-//! that only one key can talk it out of stopping.
+//! that only the owner can talk it out of stopping.
 //!
-//! Three things that unit tests cannot show, because they are about the
-//! wire and the process rather than about arithmetic:
+//! Four things that unit tests cannot show, because they are about the wire
+//! and the process rather than about arithmetic:
 //!
-//! - the **global cap** refuses a key that is inside its own quota, which is
+//! - the **total cap** refuses a key that is inside its own quota, which is
 //!   the control that actually bounds a script, since new keys are free;
-//! - a **Lightning URI** is refused for a stated reason rather than
-//!   attempted, matching what `get_info` advertises;
-//! - the **control key** can pause and change policy live, and no other key
-//!   can — including one with a perfectly good wallet connection.
+//! - a **Lightning method** is refused as not implemented, matching what
+//!   `get_info` advertises — a faucet with no Lightning wallet says so;
+//! - a grant from a key that is **not an owner** changes nothing, which is
+//!   [dln-node#1](https://github.com/DarkWebDivingClub/dln-node/issues/1);
+//! - the owner widens and revokes **live, with no restart**, because a
+//!   grant is an event rather than a config file.
+//!
+//! The last two replaced `pause`, `resume` and `set_policy`, which this
+//! faucet invented and mission 13.4 removed. There is no global pause any
+//! more: the open-faucet policy is an `OTHERS` grant, and revoking it is
+//! what closing the faucet means.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
+use nostr_faucet_e2e_test::*;
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip04;
-use nwc::nostr::nips::nip47::{
-    Method, PayBip321Request, Request, RequestParams, Response,
-};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use dln_e2e_harness::bitcoind::BitcoindHarness;
 use dln_e2e_harness::process::ManagedChild;
@@ -35,23 +38,24 @@ const WINDOW_SECS: u64 = 120;
 /// their own untouched one-coin quota.
 const TOTAL_CAP_SAT: u64 = 200_000_000;
 
-const CONTROL_REQUEST_KIND: u16 = 23198;
-const CONTROL_RESPONSE_KIND: u16 = 23199;
+/// One coin per asker, per window. Written as a grant, which is where all
+/// per-key policy lives now.
+fn one_coin_grant() -> String {
+    format!(
+        r#"{{"methods":{{"OTHERS":{{}}}},"quota":{{"amount":{ONE_COIN_SAT},"per_secs":{WINDOW_SECS},"max_capacity":{ONE_COIN_SAT}}}}}"#
+    )
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,testcontainers=warn")),
         )
         .init();
-
     match run().await {
-        Ok(()) => {
-            println!("\n=== PASS ===");
-            std::process::exit(0);
-        }
+        Ok(()) => println!("\n=== PASS ==="),
         Err(e) => {
             eprintln!("\n=== FAIL ===\n{e:?}");
             std::process::exit(1);
@@ -73,106 +77,125 @@ async fn run() -> Result<()> {
     node.mine_blocks(PREMINE, &miner_addr).await;
     node.create_wallet("treasury").await;
 
-    let control = Keys::generate();
+    let owner = Keys::generate();
     let (faucet_pubkey, _child) =
-        start_faucet(&node, &relay_url, &faucet_bin, &out, &control.public_key()).await?;
+        start_faucet(&node, &relay_url, &faucet_bin, &out, &owner).await?;
 
-    // ── The global cap ───────────────────────────────────────────────────
+    // ── The total cap ────────────────────────────────────────────────────
     // Two keys take a coin each, exhausting a two-coin cap. A third key has
     // taken nothing and is well inside its own quota, and must still be
-    // refused — that is the whole point of having a cap as well as a quota.
-    tracing::info!("Step 1: two keys exhaust the global cap");
+    // refused — that is the whole point of a cap as well as a quota, and it
+    // is the one limit that is still the faucet's rather than a grant's.
+    tracing::info!("Step 1: two keys exhaust the total cap");
     for i in 1..=2 {
         let asker = Keys::generate();
+        publish_grant(&owner, &faucet_pubkey, &asker.public_key(), &one_coin_grant(), &relay_url)
+            .await?;
         let addr = treasury_address(&node).await?;
-        let resp = ask(&relay_url, &asker, &faucet_pubkey, &format!("bitcoin:{addr}?amount=1")).await?;
-        anyhow::ensure!(resp.error.is_none(), "asker {i} was refused: {:?}", resp.error);
+        let resp = ask(&relay_url, &asker, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+        anyhow::ensure!(refusal(&resp).is_none(), "asker {i} was refused: {:?}", refusal(&resp));
         node.mine_blocks(1, &miner_addr).await;
     }
 
     tracing::info!("Step 2: a third key, inside its own quota, is refused by the cap");
     let fresh = Keys::generate();
+    publish_grant(&owner, &faucet_pubkey, &fresh.public_key(), &one_coin_grant(), &relay_url)
+        .await?;
     let addr = treasury_address(&node).await?;
-    let resp = ask(&relay_url, &fresh, &faucet_pubkey, &format!("bitcoin:{addr}?amount=1")).await?;
-    let err = resp
-        .error
-        .context("a key inside its own quota was paid past the global cap — the cap is not enforced")?;
+    let resp = ask(&relay_url, &fresh, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let message = resp_refusal(&resp, "a key inside its own quota was paid past the total cap")?;
     anyhow::ensure!(
-        err.message.contains("capped"),
-        "refused, but not by the cap: {}",
-        err.message
+        message.contains("total cap"),
+        "refused, but not by the cap: {message}"
     );
-    anyhow::ensure!(
-        err.message.contains("not about your key"),
-        "the refusal blames the asker for a faucet-wide limit: {}",
-        err.message
-    );
-    tracing::info!("  refused — {}", err.message);
+    tracing::info!("  refused — {message}");
 
-    // ── A Lightning URI, which this faucet cannot pay ────────────────────
-    tracing::info!("Step 3: a lightning-only URI is refused for a stated reason");
-    let lnonly = Keys::generate();
-    let resp = ask(
+    // ── A Lightning method, which this faucet does not implement ─────────
+    tracing::info!("Step 3: a Lightning method is refused as not implemented");
+    let resp = call(
         &relay_url,
-        &lnonly,
+        &fresh,
         &faucet_pubkey,
-        "bitcoin:?lightning=lnbc1p000000000000000000000000000000000000000000",
+        "pay_invoice",
+        json!({"invoice": "lnbcrt1p000000"}),
     )
     .await?;
-    let err = resp.error.context("a lightning URI was accepted by an on-chain-only faucet")?;
+    let code = resp
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .context("pay_invoice was not refused by an on-chain-only faucet")?;
     anyhow::ensure!(
-        err.message.contains("on-chain only"),
-        "refused, but without saying why: {}",
-        err.message
+        code == "NOT_IMPLEMENTED",
+        "refused as {code}, expected NOT_IMPLEMENTED — the faucet implements \
+         no Lightning method and its info event says so"
     );
-    tracing::info!("  refused — {}", err.message);
+    tracing::info!("  refused — NOT_IMPLEMENTED");
 
-    // ── The control key ──────────────────────────────────────────────────
-    tracing::info!("Step 4: a key that is not the control key cannot control it");
+    // ── Who may change the limits ────────────────────────────────────────
+    // This replaced `pause` and `set_policy`. There is no control method to
+    // guard any more; there is a grant, and it counts only if an owner
+    // signed it.
+    tracing::info!("Step 4: a grant from a key that is not an owner changes nothing");
+    //
+    // Asserted on the **error code**, not merely on being refused. The cap
+    // is exhausted by now, so a key that the impostor's grant *did*
+    // authorize would still be refused — by the cap. Only the code tells
+    // the two apart:
+    //
+    //   UNAUTHORIZED    the grant was ignored, which is correct
+    //   QUOTA_EXCEEDED  the grant took effect and the cap caught it, which
+    //                   is dln-node#1
+    //
+    // The key is new and the owner has never granted it, so it has no
+    // authorization of its own to fall back on.
+    let victim = Keys::generate();
     let impostor = Keys::generate();
-    let resp = control_call(&relay_url, &impostor, &faucet_pubkey, json!({"method": "pause"})).await?;
-    anyhow::ensure!(
-        resp["ok"] == json!(false),
-        "an arbitrary key was allowed to pause the faucet: {resp}"
+    let greedy = format!(
+        r#"{{"methods":{{"OTHERS":{{}}}},"quota":{{"amount":{},"per_secs":1,"max_capacity":{}}}}}"#,
+        ONE_COIN_SAT * 100,
+        ONE_COIN_SAT * 100
     );
-    tracing::info!("  refused — {}", resp["message"].as_str().unwrap_or(""));
-
-    tracing::info!("Step 5: the control key raises the cap, live, with no restart");
-    let resp = control_call(
-        &relay_url,
-        &control,
-        &faucet_pubkey,
-        json!({"method": "set_policy", "params": {"total_cap_sat": 1_000_000_000u64}}),
-    )
-    .await?;
-    anyhow::ensure!(resp["ok"] == json!(true), "control key was refused: {resp}");
-    tracing::info!("  {}", resp["message"].as_str().unwrap_or(""));
-
-    // The same key that was capped a moment ago should now be paid, and the
-    // process was never restarted.
+    publish_grant(&impostor, &faucet_pubkey, &victim.public_key(), &greedy, &relay_url).await?;
     let addr = treasury_address(&node).await?;
-    let resp = ask(&relay_url, &fresh, &faucet_pubkey, &format!("bitcoin:{addr}?amount=1")).await?;
+    let resp = ask(&relay_url, &victim, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let code = resp
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .context("a grant signed by a non-owner took effect — dln-node#1")?;
     anyhow::ensure!(
-        resp.error.is_none(),
-        "raising the cap did not take effect without a restart: {:?}",
-        resp.error
+        code == "UNAUTHORIZED",
+        "refused as {code}, expected UNAUTHORIZED — anything else means the \
+         impostor's grant authorized this key and something later refused it"
     );
-    tracing::info!("  the previously-capped key is now paid");
+    tracing::info!("  refused as UNAUTHORIZED — only an owner's grant counts");
 
-    tracing::info!("Step 6: the control key pauses, and everyone is refused");
-    let resp = control_call(&relay_url, &control, &faucet_pubkey, json!({"method": "pause"})).await?;
-    anyhow::ensure!(resp["ok"] == json!(true), "pause was refused: {resp}");
-
+    // ── The owner, live ──────────────────────────────────────────────────
+    tracing::info!("Step 5: the owner revokes, live, with no restart");
+    let alice = Keys::generate();
+    publish_grant(&owner, &faucet_pubkey, &alice.public_key(), &one_coin_grant(), &relay_url)
+        .await?;
+    publish_grant(&owner, &faucet_pubkey, &alice.public_key(), "{}", &relay_url).await?;
     let addr = treasury_address(&node).await?;
-    let resp = ask(&relay_url, &Keys::generate(), &faucet_pubkey, &format!("bitcoin:{addr}?amount=1")).await?;
-    let err = resp.error.context("the faucet paid while paused")?;
-    anyhow::ensure!(err.message.contains("paused"), "refused, but not as paused: {}", err.message);
-    tracing::info!("  refused — {}", err.message);
+    let resp = ask(&relay_url, &alice, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let code = resp
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .context("an empty grant did not revoke")?;
+    anyhow::ensure!(
+        code == "UNAUTHORIZED" || code == "RESTRICTED",
+        "refused as {code} — a revoked key must be refused for the revocation, \
+         not by a limit that would have refused it anyway"
+    );
+    tracing::info!("  refused as {code} — for the revocation, not for a limit");
+    tracing::info!("  an empty grant is how a faucet closes; there is no pause method");
 
     Ok(())
 }
 
-// ── plumbing ─────────────────────────────────────────────────────────────
+/// The refusal message, or a failure carrying `why`.
+fn resp_refusal(v: &serde_json::Value, why: &str) -> Result<String> {
+    refusal(v).context(why.to_string())
+}
 
 fn faucet_binary() -> Result<String> {
     if let Ok(p) = std::env::var("NOSTR_FAUCET_BINARY") {
@@ -193,122 +216,28 @@ async fn start_faucet(
     relay_url: &str,
     binary: &str,
     out: &std::path::Path,
-    control_pubkey: &PublicKey,
+    owner: &Keys,
 ) -> Result<(PublicKey, ManagedChild)> {
     let keys = Keys::generate();
     std::fs::create_dir_all(out)?;
     let cfg_path = out.join("faucet.toml");
     std::fs::write(
         &cfg_path,
-        format!(
-            r#"
-[nostr]
-relay = "{relay_url}"
-secret_key = "{}"
-control_pubkey = "{}"
-
-[bitcoind]
-rpc_host = "127.0.0.1"
-rpc_port = {}
-rpc_user = "{}"
-rpc_password = "{}"
-wallet = "testwallet"
-chain_label = "limits.regtest"
-
-[policy]
-per_key_sat = {ONE_COIN_SAT}
-window_secs = {WINDOW_SECS}
-total_cap_sat = {TOTAL_CAP_SAT}
-max_requests_per_window = 10
-paused = false
-"#,
-            keys.secret_key().to_secret_hex(),
-            control_pubkey.to_hex(),
+        faucet_toml(
+            relay_url,
+            &keys.secret_key().to_secret_hex(),
+            &owner.public_key(),
             node.rpc_port(),
             node.rpc_user(),
             node.rpc_password(),
+            "limits.regtest",
+            TOTAL_CAP_SAT,
+            WINDOW_SECS,
         ),
     )?;
     let child = ManagedChild::spawn("faucet", binary, &[cfg_path.to_str().unwrap()], out)?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     Ok((keys.public_key(), child))
-}
-
-async fn ask(relay: &str, asker: &Keys, faucet: &PublicKey, uri: &str) -> Result<Response> {
-    let req = Request {
-        method: Method::PayBip321,
-        params: RequestParams::PayBip321(PayBip321Request { uri: uri.to_string() }),
-    };
-    let raw = round_trip(
-        relay,
-        asker,
-        faucet,
-        Kind::WalletConnectRequest,
-        Kind::WalletConnectResponse,
-        serde_json::to_string(&req)?,
-    )
-    .await?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-async fn control_call(
-    relay: &str,
-    sender: &Keys,
-    faucet: &PublicKey,
-    body: Value,
-) -> Result<Value> {
-    let raw = round_trip(
-        relay,
-        sender,
-        faucet,
-        Kind::Custom(CONTROL_REQUEST_KIND),
-        Kind::Custom(CONTROL_RESPONSE_KIND),
-        body.to_string(),
-    )
-    .await?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-async fn round_trip(
-    relay: &str,
-    sender: &Keys,
-    faucet: &PublicKey,
-    req_kind: Kind,
-    resp_kind: Kind,
-    plaintext: String,
-) -> Result<String> {
-    let client = Client::builder().signer(sender.clone()).build();
-    client.add_relay(relay).await?;
-    client.connect().await;
-
-    client
-        .subscribe(
-            Filter::new()
-                .kind(resp_kind)
-                .pubkey(sender.public_key())
-                .since(Timestamp::now()),
-        )
-        .await?;
-
-    let encrypted = nip04::encrypt(sender.secret_key(), faucet, plaintext)?;
-    client
-        .send_event_builder(EventBuilder::new(req_kind, encrypted).tag(Tag::public_key(*faucet)))
-        .await?;
-
-    let mut notifications = client.notifications();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        anyhow::ensure!(!remaining.is_zero(), "no answer from the faucet in 30s");
-        let next = tokio::time::timeout(remaining, notifications.next()).await;
-        let Ok(Some(ClientNotification::Event { event, .. })) = next else { continue };
-        if event.kind != resp_kind || event.pubkey != *faucet {
-            continue;
-        }
-        let out = nip04::decrypt(sender.secret_key(), faucet, &event.content)?;
-        let _ = client.disconnect().await;
-        return Ok(out);
-    }
 }
 
 async fn treasury_address(node: &BitcoindHarness) -> Result<String> {

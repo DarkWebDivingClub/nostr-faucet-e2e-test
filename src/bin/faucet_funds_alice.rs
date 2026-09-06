@@ -21,9 +21,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use nostr_faucet_e2e_test::*;
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip04;
-use nwc::nostr::nips::nip47::{Method, Request, RequestParams, Response};
 use serde_json::json;
 
 use dln_e2e_harness::bitcoind::BitcoindHarness;
@@ -86,7 +85,12 @@ async fn run() -> Result<()> {
     let knots = BitcoindHarness::start_knots().await;
 
     let alice = Keys::generate();
+    // The owner is the only key whose grants a faucet accepts. It replaces
+    // `control_pubkey`, and it is what the faucet's policy is written with
+    // now: there is no policy file any more.
+    let owner = Keys::generate();
     tracing::info!("  alice is {}", alice.public_key());
+    tracing::info!("  owner is {}", owner.public_key());
 
     let mut chains = Vec::new();
     for (label, node) in [("btc.regtest", core), ("btk.regtest", knots)] {
@@ -95,7 +99,20 @@ async fn run() -> Result<()> {
         node.create_wallet("treasury").await;
 
         let (faucet_pubkey, child) =
-            start_faucet(label, &node, &relay_url, &faucet_bin, &out).await?;
+            start_faucet(label, &node, &relay_url, &faucet_bin, &out, &owner).await?;
+
+        // One coin per window, as a grant rather than a config key. This is
+        // the whole of what used to be `[policy] per_key_sat/window_secs`.
+        publish_grant(
+            &owner,
+            &faucet_pubkey,
+            &alice.public_key(),
+            &format!(
+                r#"{{"methods":{{"OTHERS":{{}}}},"quota":{{"amount":{ONE_COIN_SAT},"per_secs":{WINDOW_SECS},"max_capacity":{ONE_COIN_SAT}}}}}"#
+            ),
+            &relay_url,
+        )
+        .await?;
 
         chains.push(Chain { label, node, faucet_pubkey, _faucet: child, miner_addr });
     }
@@ -105,15 +122,13 @@ async fn run() -> Result<()> {
     for c in &chains {
         let before = treasury_balance(&c.node).await?;
         let addr = treasury_address(&c.node).await?;
-        let uri = format!("bitcoin:{addr}?amount=1");
 
-        let resp = ask(&relay_url, &alice, &c.faucet_pubkey, &uri).await?;
+        let resp = ask(&relay_url, &alice, &c.faucet_pubkey, &addr, ONE_COIN_SAT).await?;
         anyhow::ensure!(
-            resp.error.is_none(),
-            "{}: the faucet refused a first request from a new key, which the open \
-             policy should allow: {:?}",
+            refusal(&resp).is_none(),
+            "{}: the faucet refused a first request from a granted key: {:?}",
             c.label,
-            resp.error
+            refusal(&resp)
         );
 
         // A txid is not money. Confirm it.
@@ -131,49 +146,46 @@ async fn run() -> Result<()> {
     tracing::info!("Step 3: a second coin inside the window is refused, and says why");
     for c in &chains {
         let addr = treasury_address(&c.node).await?;
-        let uri = format!("bitcoin:{addr}?amount=1");
-        let resp = ask(&relay_url, &alice, &c.faucet_pubkey, &uri).await?;
+        let resp = ask(&relay_url, &alice, &c.faucet_pubkey, &addr, ONE_COIN_SAT).await?;
 
-        let err = resp.error.context(format!(
+        let message = refusal(&resp).context(format!(
             "{}: a second coin inside the window was paid — the quota is not enforced",
             c.label
         ))?;
         anyhow::ensure!(
-            err.message.contains("quota"),
-            "{}: refused, but not for the quota: {}",
-            c.label,
-            err.message
+            message.to_lowercase().contains("quota"),
+            "{}: refused, but not for the quota: {message}",
+            c.label
         );
-        anyhow::ensure!(
-            err.message.contains("try again in"),
-            "{}: the refusal does not say when to come back: {}",
-            c.label,
-            err.message
-        );
-        tracing::info!("  {}: refused — {}", c.label, err.message);
+        tracing::info!("  {}: refused — {message}", c.label);
     }
 
     // ── Capabilities, so a client can know before it asks ────────────────
-    tracing::info!("Step 4: each faucet advertises onchain and nothing else");
+    tracing::info!("Step 4: each faucet advertises exactly what it implements");
     for c in &chains {
-        let resp = get_info(&relay_url, &alice, &c.faucet_pubkey).await?;
-        let value = serde_json::to_value(&resp)?;
-        let methods = value
-            .pointer("/result/bip321_methods")
-            .context("get_info carries no bip321_methods")?;
-        let listed: Vec<String> = methods
+        let resp = call(&relay_url, &alice, &c.faucet_pubkey, "get_info", json!({})).await?;
+        let listed: Vec<String> = resp
+            .pointer("/result/methods")
+            .context("get_info carries no methods")?
             .as_array()
-            .context("bip321_methods is not an array")?
+            .context("methods is not an array")?
             .iter()
-            .filter_map(|m| m.get("method").and_then(|x| x.as_str()).map(String::from))
+            .filter_map(|m| m.as_str().map(String::from))
             .collect();
+        // Generated by #[nostr_ln::service] from the impl block, so it
+        // cannot disagree with what the faucet answers — and it names no
+        // Lightning method, because the faucet has no Lightning wallet.
         anyhow::ensure!(
-            listed == vec!["onchain".to_string()],
-            "{}: advertises {listed:?}, expected only onchain — a faucet with no \
-             Lightning wallet should say so before a client asks",
+            listed == vec!["get_balance".to_string(), "get_info".to_string(), "pay_onchain".to_string()],
+            "{}: advertises {listed:?}",
             c.label
         );
-        tracing::info!("  {}: bip321_methods = {listed:?}", c.label);
+        anyhow::ensure!(
+            !listed.iter().any(|m| m.contains("invoice")),
+            "{}: a faucet with no Lightning wallet must not advertise one",
+            c.label
+        );
+        tracing::info!("  {}: methods = {listed:?}", c.label);
     }
 
     Ok(())
@@ -202,42 +214,31 @@ async fn start_faucet(
     relay_url: &str,
     binary: &str,
     out: &std::path::Path,
+    owner: &Keys,
 ) -> Result<(PublicKey, ManagedChild)> {
     let keys = Keys::generate();
     let dir = out.join(label);
     std::fs::create_dir_all(&dir)?;
     let cfg_path = dir.join("faucet.toml");
 
-    // Window and cap in seconds and coins, not weeks — the reason both are
-    // configuration rather than constants.
+    // A window in seconds and a cap in coins, not weeks — the reason both
+    // are configuration rather than constants.
+    //
+    // No `[policy]` section: per-key limits are grants now. What is left is
+    // the one limit a grant cannot express, because it is a property of the
+    // faucet rather than of anyone asking.
     std::fs::write(
         &cfg_path,
-        format!(
-            r#"
-[nostr]
-relay = "{relay_url}"
-secret_key = "{}"
-
-[bitcoind]
-rpc_host = "127.0.0.1"
-rpc_port = {}
-rpc_user = "{}"
-rpc_password = "{}"
-wallet = "testwallet"
-chain_label = "{label}"
-
-[policy]
-per_key_sat = {ONE_COIN_SAT}
-window_secs = {WINDOW_SECS}
-total_cap_sat = {}
-max_requests_per_window = 10
-paused = false
-"#,
-            keys.secret_key().to_secret_hex(),
+        faucet_toml(
+            relay_url,
+            &keys.secret_key().to_secret_hex(),
+            &owner.public_key(),
             node.rpc_port(),
             node.rpc_user(),
             node.rpc_password(),
+            label,
             ONE_COIN_SAT * 5,
+            WINDOW_SECS,
         ),
     )?;
 
@@ -252,80 +253,6 @@ paused = false
     // loudly if it is going to.
     tokio::time::sleep(Duration::from_secs(3)).await;
     Ok((keys.public_key(), child))
-}
-
-// ── Alice, who is the test ───────────────────────────────────────────────
-
-async fn ask(relay: &str, alice: &Keys, faucet: &PublicKey, uri: &str) -> Result<Response> {
-    send(
-        relay,
-        alice,
-        faucet,
-        Request {
-            method: Method::PayBip321,
-            params: RequestParams::PayBip321(
-                nwc::nostr::nips::nip47::PayBip321Request { uri: uri.to_string() },
-            ),
-        },
-    )
-    .await
-}
-
-async fn get_info(relay: &str, alice: &Keys, faucet: &PublicKey) -> Result<Response> {
-    send(
-        relay,
-        alice,
-        faucet,
-        Request { method: Method::GetInfo, params: RequestParams::GetInfo },
-    )
-    .await
-}
-
-/// One NWC round trip. Written here rather than borrowed from the harness so
-/// this suite does not depend on another repo's internals.
-async fn send(
-    relay: &str,
-    alice: &Keys,
-    faucet: &PublicKey,
-    req: Request,
-) -> Result<Response> {
-    let client = Client::builder().signer(alice.clone()).build();
-    client.add_relay(relay).await?;
-    client.connect().await;
-
-    let sub = Filter::new()
-        .kind(Kind::WalletConnectResponse)
-        .pubkey(alice.public_key())
-        .since(Timestamp::now());
-    client.subscribe(sub).await?;
-
-    let encrypted = nip04::encrypt(
-        alice.secret_key(),
-        faucet,
-        serde_json::to_string(&req)?,
-    )?;
-    let event = EventBuilder::new(Kind::WalletConnectRequest, encrypted)
-        .tag(Tag::public_key(*faucet));
-    client.send_event_builder(event).await?;
-
-    let mut notifications = client.notifications();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "no answer from the faucet in 30s — a faucet that is down and a faucet \
-             that refused should not look the same, so this is a failure"
-        );
-        let next = tokio::time::timeout(remaining, notifications.next()).await;
-        let Ok(Some(ClientNotification::Event { event, .. })) = next else { continue };
-        if event.kind != Kind::WalletConnectResponse || event.pubkey != *faucet {
-            continue;
-        }
-        let plaintext = nip04::decrypt(alice.secret_key(), faucet, &event.content)?;
-        let _ = client.disconnect().await;
-        return Ok(serde_json::from_str(&plaintext)?);
-    }
 }
 
 // ── the treasury Alice is filling ────────────────────────────────────────

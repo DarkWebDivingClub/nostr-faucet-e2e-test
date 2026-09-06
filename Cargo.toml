@@ -10,7 +10,7 @@ publish = false
 dln-e2e-harness = { git = "https://github.com/DarkWebDivingClub/diamond-x-e2e-test.git", branch = "master" }
 
 nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
-nwc = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
+nostr-ln = { git = "https://github.com/DarkWebDivingClub/nostr-ln.git", branch = "master" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util"] }
 anyhow = "1"

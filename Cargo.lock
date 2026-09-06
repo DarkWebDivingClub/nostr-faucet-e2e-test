@@ -1483,8 +1483,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dln-e2e-harness",
+ "nostr-ln",
  "nostr-sdk",
- "nwc",
  "serde_json",
  "tokio",
  "tracing",
@@ -1497,6 +1497,28 @@ version = "0.44.0"
 source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "nostr",
+]
+
+[[package]]
+name = "nostr-ln"
+version = "0.1.0"
+source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#9db54f168c7328e13e95b0d8d3873148cc26c0cc"
+dependencies = [
+ "nostr",
+ "nostr-ln-macros",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "nostr-ln-macros"
+version = "0.1.0"
+source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#9db54f168c7328e13e95b0d8d3873148cc26c0cc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

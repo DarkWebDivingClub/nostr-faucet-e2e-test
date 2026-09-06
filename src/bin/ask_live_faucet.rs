@@ -18,12 +18,11 @@
 //!
 //! Nothing here is spun up or torn down. Everything it talks to outlives it.
 
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip04;
-use nwc::nostr::nips::nip47::{Method, PayBip321Request, Request, RequestParams, Response};
+use nostr_faucet_e2e_test::*;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() {
@@ -65,45 +64,30 @@ async fn run() -> Result<String> {
     tracing::info!("  for {amount} to {dest}");
 
     // What it says it can do, before asking it to do anything.
-    let info = round_trip(
-        &relay,
-        &asker,
-        &faucet,
-        Request { method: Method::GetInfo, params: RequestParams::GetInfo },
-    )
-    .await
-    .context("get_info failed — is the faucet running and on this relay?")?;
-    let info_json = serde_json::to_value(&info)?;
-    let methods = info_json
-        .pointer("/result/bip321_methods")
+    let info = call(&relay, &asker, &faucet, "get_info", json!({}))
+        .await
+        .context("get_info failed — is the faucet running and on this relay?")?;
+    let methods = info
+        .pointer("/result/methods")
         .map(|m| m.to_string())
         .unwrap_or_else(|| "none".into());
-    let network = info_json
+    let network = info
         .pointer("/result/network")
         .and_then(|n| n.as_str())
         .unwrap_or("unknown");
-    let height = info_json.pointer("/result/block_height").map(|h| h.to_string());
-    tracing::info!("  it says: network {network}, height {}, bip321_methods {methods}",
-        height.unwrap_or_else(|| "unknown".into()));
+    tracing::info!("  it says: network {network}, methods {methods}");
 
-    let uri = format!("bitcoin:{dest}?amount={amount}");
-    let resp = round_trip(
-        &relay,
-        &asker,
-        &faucet,
-        Request {
-            method: Method::PayBip321,
-            params: RequestParams::PayBip321(PayBip321Request { uri }),
-        },
-    )
-    .await?;
+    // An address and an amount in sats. No BIP-321 URI: `pay_onchain` is
+    // what a faucet with no Lightning wallet implements.
+    let amount_sats = (amount.parse::<f64>().context("amount is not a number")? * 100_000_000.0)
+        .round() as u64;
+    let resp = ask(&relay, &asker, &faucet, &dest, amount_sats).await?;
 
-    if let Some(err) = resp.error {
-        anyhow::bail!("the faucet refused: {} ({:?})", err.message, err.code);
+    if let Some(message) = refusal(&resp) {
+        anyhow::bail!("the faucet refused: {message}");
     }
 
-    let value = serde_json::to_value(&resp)?;
-    let txid = value
+    let txid = resp
         .pointer("/result/txid")
         .and_then(|t| t.as_str())
         .context("the faucet answered without a txid")?
@@ -114,50 +98,4 @@ async fn run() -> Result<String> {
     tracing::info!("  paid — {txid}");
     tracing::info!("  a txid is not a confirmation: check the destination chain");
     Ok(txid)
-}
-
-async fn round_trip(
-    relay: &str,
-    asker: &Keys,
-    faucet: &PublicKey,
-    req: Request,
-) -> Result<Response> {
-    let client = Client::builder().signer(asker.clone()).build();
-    client.add_relay(relay).await?;
-    client.connect().await;
-
-    client
-        .subscribe(
-            Filter::new()
-                .kind(Kind::WalletConnectResponse)
-                .pubkey(asker.public_key())
-                .since(Timestamp::now()),
-        )
-        .await?;
-
-    let encrypted = nip04::encrypt(asker.secret_key(), faucet, serde_json::to_string(&req)?)?;
-    client
-        .send_event_builder(
-            EventBuilder::new(Kind::WalletConnectRequest, encrypted).tag(Tag::public_key(*faucet)),
-        )
-        .await?;
-
-    let mut notifications = client.notifications();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        anyhow::ensure!(
-            !remaining.is_zero(),
-            "no answer in 45s — a faucet that is down and one that refused should not \
-             look the same, so this is a failure rather than a refusal"
-        );
-        let next = tokio::time::timeout(remaining, notifications.next()).await;
-        let Ok(Some(ClientNotification::Event { event, .. })) = next else { continue };
-        if event.kind != Kind::WalletConnectResponse || event.pubkey != *faucet {
-            continue;
-        }
-        let plaintext = nip04::decrypt(asker.secret_key(), faucet, &event.content)?;
-        let _ = client.disconnect().await;
-        return Ok(serde_json::from_str(&plaintext)?);
-    }
 }
