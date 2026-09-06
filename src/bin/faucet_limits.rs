@@ -189,6 +189,87 @@ async fn run() -> Result<()> {
     tracing::info!("  refused as {code} — for the revocation, not for a limit");
     tracing::info!("  an empty grant is how a faucet closes; there is no pause method");
 
+    // ── OTHERS, which is what makes a faucet open ────────────────────────
+    tracing::info!("Step 6: OTHERS opens the faucet; an explicit empty grant still denies");
+    publish_grant_for(&owner, &faucet_pubkey, "OTHERS", &one_coin_grant(), &relay_url).await?;
+
+    // The cap is exhausted by now, so nobody gets paid here — which is
+    // fine, because what is being tested is *authorization*, and the error
+    // code separates it cleanly from the cap.
+    let stranger = Keys::generate();
+    let addr = treasury_address(&node).await?;
+    let resp = ask(&relay_url, &stranger, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let code = resp
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("<paid>");
+    anyhow::ensure!(
+        code != "UNAUTHORIZED" && code != "RESTRICTED",
+        "a key with no grant of its own was refused as {code} while an OTHERS \
+         grant was in force — OTHERS is what makes the faucet open"
+    );
+    tracing::info!("  a stranger is authorized by OTHERS (refused as {code}, not for authorization)");
+
+    // An explicit entry beats OTHERS, which is what makes a deny-list
+    // possible on top of an open policy. Alice was revoked in step 5 and
+    // OTHERS has since been published; she must still be refused.
+    let resp = ask(&relay_url, &alice, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let code = resp
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("<paid>");
+    anyhow::ensure!(
+        code == "UNAUTHORIZED" || code == "RESTRICTED",
+        "a key with an explicit empty grant was let through by OTHERS \
+         (refused as {code}) — an explicit entry must beat the default, or \
+         a deny-list is impossible on an open faucet"
+    );
+    tracing::info!("  and an explicit empty grant still denies — refused as {code}");
+
+    // ── `rate`, spelled as the specification spells it ───────────────────
+    // dln-node#2 is this field named `access_rate`, which makes a
+    // conforming grant deserialise to **no limit at all** — silent, and in
+    // the permissive direction. So the test is that a grant written against
+    // the specification actually limits.
+    //
+    // Rate is step 5a of the pipeline, before the cost is prepared and
+    // before the cap is checked, so this reads clearly even with the cap
+    // exhausted: the first ask is refused by the cap, the second by the
+    // rate.
+    tracing::info!("Step 7: a grant using `rate` limits, rather than silently not");
+    let hasty = Keys::generate();
+    publish_grant(
+        &owner,
+        &faucet_pubkey,
+        &hasty.public_key(),
+        &format!(
+            r#"{{"methods":{{"pay_onchain":{{"rate":{{"amount":1,"per_secs":600,"max_capacity":1}}}}}},"quota":{{"amount":{ONE_COIN_SAT},"per_secs":{WINDOW_SECS},"max_capacity":{ONE_COIN_SAT}}}}}"#
+        ),
+        &relay_url,
+    )
+    .await?;
+
+    let first = ask(&relay_url, &hasty, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let first_code =
+        first.pointer("/error/code").and_then(|c| c.as_str()).unwrap_or("<paid>");
+    anyhow::ensure!(
+        first_code != "RATE_LIMITED",
+        "the first request of a one-per-window rate was already rate limited"
+    );
+
+    let second = ask(&relay_url, &hasty, &faucet_pubkey, &addr, ONE_COIN_SAT).await?;
+    let second_code = second
+        .pointer("/error/code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("<paid>");
+    anyhow::ensure!(
+        second_code == "RATE_LIMITED",
+        "a second request inside a one-per-window `rate` was refused as \
+         {second_code} — a grant that names `rate` must limit. Deserialising \
+         it to no limit at all is dln-node#2"
+    );
+    tracing::info!("  second request refused as RATE_LIMITED — `rate` is read, not ignored");
+
     Ok(())
 }
 

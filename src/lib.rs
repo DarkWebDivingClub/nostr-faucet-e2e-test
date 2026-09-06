@@ -73,12 +73,27 @@ pub async fn publish_grant(
     profile: &str,
     relay: &str,
 ) -> Result<()> {
+    publish_grant_for(owner, faucet, &asker.to_hex(), profile, relay).await
+}
+
+/// As [`publish_grant`], but for a `d`-tag controller that is not a key.
+///
+/// The one that matters is the literal `OTHERS`, which is the grant applied
+/// to any key with no grant of its own — an open faucet, expressed as a
+/// grant rather than as a config flag.
+pub async fn publish_grant_for(
+    owner: &Keys,
+    faucet: &PublicKey,
+    controller: &str,
+    profile: &str,
+    relay: &str,
+) -> Result<()> {
     let client = Client::builder().signer(owner.clone()).build();
     client.add_relay(relay).await?;
     client.connect().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let d = format!("{}:{}", faucet.to_hex(), asker.to_hex());
+    let d = format!("{}:{}", faucet.to_hex(), controller);
     let event = EventBuilder::new(Kind::Custom(GRANT_KIND), profile)
         .tags([Tag::identifier(d), Tag::public_key(*faucet)])
         .sign(owner)

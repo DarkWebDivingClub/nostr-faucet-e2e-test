@@ -1502,7 +1502,7 @@ dependencies = [
 [[package]]
 name = "nostr-ln"
 version = "0.1.0"
-source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#9db54f168c7328e13e95b0d8d3873148cc26c0cc"
+source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#fac6074bb51ad9fd11bddf9f5575b9b8e9034936"
 dependencies = [
  "nostr",
  "nostr-ln-macros",
@@ -1514,7 +1514,7 @@ dependencies = [
 [[package]]
 name = "nostr-ln-macros"
 version = "0.1.0"
-source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#9db54f168c7328e13e95b0d8d3873148cc26c0cc"
+source = "git+https://github.com/DarkWebDivingClub/nostr-ln.git?branch=master#fac6074bb51ad9fd11bddf9f5575b9b8e9034936"
 dependencies = [
  "proc-macro2",
  "quote",
